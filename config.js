@@ -10,5 +10,5 @@ window.APP_CONFIG = {
   // endpoint : Apps Script をウェブアプリとして公開したときに発行される URL
   // appToken : Apps Script のスクリプトプロパティ APP_TOKEN と同じ文字列
   endpoint: '',
-  appToken: ''
+  appToken: 'kg-yt8SSjLCmpt2lrqqZqau9EUa'
 };
