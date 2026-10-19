@@ -90,6 +90,10 @@
   .rate button{background:#fff;border:2px solid var(--line);color:#444;width:46px;padding:8px 0}
   .rate button.on{background:var(--main);border-color:var(--main);color:#fff}
   audio{width:100%;margin:8px 0}
+  .live{background:#f7fbff;border:1px dashed #9ec5f0;border-radius:10px;padding:8px 12px;margin-top:10px}
+  .live-h{font-size:.78rem;color:var(--sub)}
+  .live-t{font-size:.95rem;min-height:1.6em;white-space:pre-wrap;word-break:break-all}
+  .recwarn{color:#c92a2a;font-weight:600}
 
   /* 採点 */
   .scorebox{border:2px solid var(--main);border-radius:14px;padding:14px;margin:12px 0;background:#f7fbff}
@@ -182,6 +186,8 @@
       <div class="grp"><div class="gl">質問の読み上げ</div><div class="seg" data-opt="voice"></div></div>
       <div class="grp"><div class="gl">質問の文字</div><div class="seg" data-opt="hideText"></div></div>
       <div class="grp"><div class="gl">録音の始まり方</div><div class="seg" data-opt="auto"></div></div>
+      <div class="grp"><div class="gl">録音と文字起こし</div><div class="seg" data-opt="mode"></div>
+        <p class="hint">スマホ（特にAndroid）では、録音と文字起こしを同時にすると文字が出ないことがあります。そのときは「文字起こし優先」にしてください（自分の声の聞き直しはできなくなります）。</p></div>
       <div class="grp"><div class="gl">模範例</div><div class="seg" data-opt="model"></div></div>
     </div>
 
@@ -236,6 +242,7 @@
         <button class="b-warn" id="btnPause" type="button" disabled>⏸ 中断</button>
         <button class="b-sub" id="btnStopAns" type="button" disabled>■ 答え終わり</button>
       </div>
+      <div class="live" id="liveBox" hidden><div class="live-h">いま聞き取れている言葉（文字起こし）</div><div id="liveTrans" class="live-t"></div></div>
       <p class="hint" id="recHint"></p>
     </div>
 
@@ -385,7 +392,8 @@
     voice:   {def:(MAN ? 'file' : 'browser'), list:[['file','VOICEVOXの声'],['browser','ブラウザの声'],['off','読み上げない']]},
     hideText:{def:false,  list:[[false,'見せる'],[true,'隠す（聞き取り練習）']]},
     auto:    {def:true,   list:[[true,'読み上げのあと自動で'],[false,'ボタンを押して']]},
-    model:   {def:'after',list:[['after','答えたあとに見る'],['never','見ない']]}
+    model:   {def:'after',list:[['after','答えたあとに見る'],['never','見ない']]},
+    mode:    {def:(/Android|iPhone|iPad/i.test(navigator.userAgent) ? 'text' : 'both'), list:[['both','録音＋文字起こし'],['text','文字起こし優先（録音しない）']]}
   };
   const opts = {};
   Object.keys(OPTDEF).forEach(k => { opts[k] = (store.opts && k in store.opts) ? store.opts[k] : OPTDEF[k].def; });
@@ -551,11 +559,21 @@
   /* ---------- 練習の開始（通し／1問ずつ） ---------- */
   async function beginSession(queue, single){
     S = {queue, idx:0, results:[], token:0, stream:null, micOk:false, cur:null, audio:null, audioFin:null, single:!!single, set:curSet};
-    if(navigator.mediaDevices && window.MediaRecorder){
-      try{ S.stream = await navigator.mediaDevices.getUserMedia({audio:true}); S.micOk = true; }catch(_){ S.micOk = false; }
+    S.permDenied = false;
+    if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && (window.MediaRecorder || SR)){
+      try{
+        const st = await navigator.mediaDevices.getUserMedia({audio:true});
+        if(opts.mode === 'text' && SR){ st.getTracks().forEach(t => t.stop()); S.micOk = false; }   // 文字起こしにマイクを譲る
+        else if(window.MediaRecorder){ S.stream = st; S.micOk = true; }
+        else { st.getTracks().forEach(t => t.stop()); }
+      }catch(_){ S.micOk = false; S.permDenied = true; }
     }
     show('practice');
-    $('recHint').textContent = S.micOk ? '' : 'マイクが使えないため、録音なしで練習します（時間を計るだけです）。ブラウザのマイクの許可をご確認ください。';
+    let hint = '';
+    if(S.permDenied) hint = 'マイクが許可されていません。ブラウザのアドレス欄の鍵（またはマイク）のマークから、マイクを「許可」にして、ページを読み込み直してください。';
+    else if(!SR) hint = 'このブラウザは自動の文字起こしに対応していません。Chrome（またはEdge）でお使いください。文字起こしなしでも、時間を計って練習できます。';
+    else if(!S.micOk) hint = '文字起こし優先のため、声の録音は残しません（文字起こしは行います）。';
+    $('recHint').textContent = hint; $('recHint').className = 'hint' + (S.permDenied || !SR ? ' recwarn' : '');
     runQuestion();
   }
   $('btnStart').addEventListener('click', () => {
@@ -569,7 +587,7 @@
 
   async function runQuestion(){
     const q = S.queue[S.idx]; const token = ++S.token;
-    S.cur = {q, stage:'reading', elapsed:0, startedAt:0, paused:false, chunks:[], blob:null, url:null, trans:'', committed:false, mr:null, sr:null, srFatal:false, tick:null, score:null};
+    S.cur = {q, stage:'reading', elapsed:0, startedAt:0, paused:false, chunks:[], blob:null, url:null, trans:'', committed:false, mr:null, sr:null, srFatal:false, srErr:'', interim:'', srRapid:0, srErrCnt:0, tick:null, score:null};
     const cat = curSet.categories.find(c => c.id === q.cat);
     if(S.single){ const n = ((store.stats[statKey(curSet,q)] || {}).n || 0) + 1; $('prog').textContent = 'この問題 ' + n + '回目'; }
     else $('prog').textContent = (S.idx + 1) + ' / ' + S.queue.length + ' 問目';
@@ -580,7 +598,7 @@
     if(hide) $('qtext').textContent = '（質問の文字は隠してあります。耳で聞いて答えましょう）';
     $('btnShowQ').hidden = !hide;
     showNotice('');
-    $('review').hidden = true; $('answerCard').hidden = false;
+    $('review').hidden = true; $('answerCard').hidden = false; $('liveBox').hidden = true;
     $('timer').textContent = opts.seconds > 0 ? mmss(opts.seconds * 1000) : '00:00';
     setBar(0);
     setButtons({rec:false, pause:false, stop:false, replay:false});
@@ -608,28 +626,62 @@
 
   /* ----- 録音 ----- */
   function curElapsed(){ const c = S.cur; return c.elapsed + (c.stage === 'recording' ? Date.now() - c.startedAt : 0); }
+  const SR_ERR = {
+    'not-allowed':'マイクの使用が許可されていません。アドレス欄のマイクの設定を「許可」にして、ページを読み込み直してください。',
+    'service-not-allowed':'このブラウザ（または端末）では音声認識の使用が許可されていません。端末の設定でGoogleの音声入力・音声認識がオンか確認してください。',
+    'audio-capture':'マイクを使えませんでした。他のアプリがマイクを使っていないか確認してください。録音と同時だと起きやすいので、ホームの「録音と文字起こし」を「文字起こし優先」にしてみてください。',
+    'network':'文字起こしにはインターネット接続が必要です（音声認識は、ブラウザの外部サービスで行われます）。通信状態をご確認ください。',
+    'language-not-supported':'このブラウザは日本語の音声認識に対応していません。'
+  };
+  function setLive(c){
+    const box = $('liveBox'); if(!box) return;
+    box.hidden = !SR;
+    $('liveTrans').textContent = (c.trans + c.interim) || (c.stage === 'recording' ? '（話すと、ここに文字が出ます）' : '');
+  }
   function startSR(){
     const c = S.cur; if(!SR || c.srFatal) return;
-    const r = new SR(); r.lang = 'ja-JP'; r.continuous = true; r.interimResults = false;
+    const r = new SR(); r.lang = 'ja-JP'; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
+    const t0 = Date.now(); let got = false;
     r.onresult = e => {
-      for(let i = e.resultIndex; i < e.results.length; i++){ if(e.results[i].isFinal) c.trans += e.results[i][0].transcript; }
+      got = true; c.srRapid = 0; c.srErrCnt = 0;
+      let interim = '';
+      for(let i = e.resultIndex; i < e.results.length; i++){
+        const res = e.results[i];
+        if(res.isFinal) c.trans += res[0].transcript; else interim += res[0].transcript;
+      }
+      c.interim = interim; setLive(c);
     };
-    r.onerror = e => { if(e.error !== 'no-speech' && e.error !== 'aborted') c.srFatal = true; };
-    r.onend = () => { if(c.sr === r){ c.sr = null; } if(c.stage === 'recording' && !c.srFatal && S.cur === c) startSR(); if(c.srEndCb){ const f = c.srEndCb; c.srEndCb = null; f(); } };
+    r.onerror = e => {
+      const k = e.error;
+      if(k === 'no-speech' || k === 'aborted') return;
+      c.srErr = SR_ERR[k] || ('文字起こしでエラーが起きました（' + k + '）。');
+      c.srErrCnt = (c.srErrCnt || 0) + 1;
+      if(k === 'not-allowed' || k === 'service-not-allowed' || k === 'language-not-supported' || c.srErrCnt >= 3) c.srFatal = true;
+      const h = $('recHint'); h.textContent = c.srErr; h.className = 'hint recwarn';
+    };
+    r.onend = () => {
+      if(c.sr === r){ c.sr = null; }
+      if(c.interim){ c.trans += c.interim; c.interim = ''; }   // 確定前の言葉も残す
+      if(!got && Date.now() - t0 < 700){ c.srRapid = (c.srRapid || 0) + 1; if(c.srRapid >= 4){ c.srFatal = true; if(!c.srErr){ c.srErr = '文字起こしが始まりませんでした。ホームの「録音と文字起こし」を「文字起こし優先」にして、もう一度お試しください。'; const h = $('recHint'); h.textContent = c.srErr; h.className = 'hint recwarn'; } } }
+      if(c.stage === 'recording' && !c.srFatal && S.cur === c) setTimeout(() => { if(c.stage === 'recording' && !c.sr && S.cur === c) startSR(); }, 250);
+      if(c.srEndCb){ const f = c.srEndCb; c.srEndCb = null; f(); }
+    };
     c.sr = r; try{ r.start(); }catch(_){ c.sr = null; }
   }
   function stopSR(){
     const c = S.cur;
     return new Promise(res => {
       if(!c.sr){ res(); return; }
-      const t = setTimeout(res, 900); c.srEndCb = () => { clearTimeout(t); res(); };
+      const t = setTimeout(res, 2500); c.srEndCb = () => { clearTimeout(t); res(); };
       try{ c.sr.stop(); }catch(_){ clearTimeout(t); res(); }
     });
   }
   function startAnswer(){
     const c = S.cur; if(!c || c.stage !== 'ready') return;
     ++S.token; stopSpeech();
-    c.chunks = []; c.trans = '';
+    c.chunks = []; c.trans = ''; c.interim = ''; c.srErr = ''; c.srFatal = false; c.srRapid = 0; c.srErrCnt = 0;
+    if(!S.permDenied && SR){ $('recHint').textContent = ''; $('recHint').className = 'hint'; }
+    startSR();
     if(S.micOk){
       try{
         c.mr = new MediaRecorder(S.stream);
@@ -638,8 +690,8 @@
       }catch(_){ c.mr = null; }
     }
     c.stage = 'recording'; c.startedAt = Date.now(); c.elapsed = 0;
-    startSR();
-    setStage('recording', S.micOk ? '● 録音中' : '● 時間を計っています');
+    setLive(c);
+    setStage('recording', S.micOk ? '● 録音中' : (SR && !S.permDenied ? '● 聞き取り中（文字起こし）' : '● 時間を計っています'));
     setButtons({rec:false, pause:true, stop:true, replay:false});
     $('btnPause').textContent = '⏸ 中断';
     c.tick = setInterval(onTick, 200); onTick();
@@ -664,7 +716,7 @@
       c.stage = 'recording'; c.startedAt = Date.now();
       if(c.mr && c.mr.state === 'paused') c.mr.resume();
       startSR();
-      setStage('recording', S.micOk ? '● 録音中' : '● 時間を計っています'); $('btnPause').textContent = '⏸ 中断';
+      setStage('recording', S.micOk ? '● 録音中' : (SR && !S.permDenied ? '● 聞き取り中（文字起こし）' : '● 時間を計っています')); $('btnPause').textContent = '⏸ 中断';
     }
   });
   $('btnStopAns').addEventListener('click', finishAnswer);
@@ -679,6 +731,8 @@
     });
     await Promise.all([mrDone, stopSR()]);
     if(S.cur !== c) return;
+    if(c.interim){ c.trans += c.interim; c.interim = ''; }
+    $('liveBox').hidden = true;
     if(c.chunks.length){ c.blob = new Blob(c.chunks, {type: (c.mr && c.mr.mimeType) || 'audio/webm'}); c.url = URL.createObjectURL(c.blob); }
     showReview();
   }
@@ -840,8 +894,9 @@
     const pl = $('player'); if(c.url){ pl.src = c.url; pl.hidden = false; } else { pl.removeAttribute('src'); pl.hidden = true; }
     $('revMeta').textContent = '話した時間：' + mmss(c.elapsed) + (opts.seconds > 0 ? '（目安 ' + opts.seconds + '秒）' : '') + (SR ? '' : '　※このブラウザは自動の文字起こしに対応していません（Chrome/Edge推奨）');
     $('trans').value = c.trans.trim();
+    if(!c.trans.trim() && SR && !c.srErr) c.srErr = '声が聞き取れませんでした。マイクに近づいて、はっきり話してみてください。うまくいかない場合は、ホームの「録音と文字起こし」を「文字起こし優先」にしてください。';
     $('btnAI').hidden = !CFG.endpoint; $('btnAI').disabled = !store.consent;
-    $('aiMsg').textContent = (CFG.endpoint && !store.consent) ? 'AI採点を使うには、ホーム画面の同意にチェックを入れてください。' : '';
+    $('aiMsg').textContent = (!c.trans.trim() && c.srErr) ? ('文字起こしできませんでした：' + c.srErr) : ((CFG.endpoint && !store.consent) ? 'AI採点を使うには、ホーム画面の同意にチェックを入れてください。' : '');
     c.score = autoScore(q, $('trans').value, Math.round(c.elapsed/1000), opts.seconds);
     renderScore();
     const area = $('modelArea'); area.innerHTML = '';
